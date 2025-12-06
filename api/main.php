@@ -86,7 +86,7 @@ function parse_cookie_value($cookieHeader, $key) {
     foreach ($parts as $p) {
         $p = trim($p);
         if (strpos($p, $key . '=') === 0) {
-            return urldecode(substr($p, strlen($key)+1));
+            return urldecode(substr($p, strlen($key) + 1));
         }
     }
     return null;
@@ -109,7 +109,6 @@ function get_bearer_token() {
 }
 
 // Helper: upload binary to supabase storage via PUT to /storage/v1/object/<bucket>/<path>
-// replaced earlier supabase_storage_put wrapper with method on $supabase
 // We'll use $supabase->storagePut($bucket, $path, $binary, $contentType)
 
 // Helper: compute sha256 hex
@@ -130,6 +129,30 @@ function redirect_with_cookie($location, $cookieName, $cookieValue, $maxAge = 25
     header("Set-Cookie: $cookieStr", false);
     header("Location: $location", true, 302);
     exit;
+}
+
+// Helper: URL-safe token generator for sessions (base64url)
+function gen_token_urlsafe($bytes = 36) {
+    $raw = random_bytes($bytes);
+    $b64 = rtrim(strtr(base64_encode($raw), '+/', '-_'), '=');
+    return $b64;
+}
+
+// Helper: RFC4122 v4 fallback if ramsey not present
+function uuid_v4_fallback() {
+    $data = random_bytes(16);
+    // set version to 0100
+    $data[6] = chr((ord($data[6]) & 0x0f) | 0x40);
+    // set bits 6-7 to 10
+    $data[8] = chr((ord($data[8]) & 0x3f) | 0x80);
+    $hex = bin2hex($data);
+    return sprintf('%s-%s-%s-%s-%s',
+        substr($hex, 0, 8),
+        substr($hex, 8, 4),
+        substr($hex, 12, 4),
+        substr($hex, 16, 4),
+        substr($hex, 20, 12)
+    );
 }
 
 // ---------- ROUTING ----------
@@ -153,6 +176,219 @@ switch ($action) {
         if ($c2 !== 200) json_out(['error'=>'User not found'],404);
         $u = json_decode($r2, true)[0] ?? null;
         json_out($u);
+        break;
+
+    // ---------------- NEW: login (implemented) ----------------
+    case 'login':
+        $method = $_SERVER['REQUEST_METHOD'];
+        if ($method === 'OPTIONS') { http_response_code(204); exit; }
+        if ($method !== 'POST') json_out(['error' => 'POST only'], 405);
+
+        $body = get_json_body();
+        $email = isset($body['email']) ? strtolower(trim($body['email'])) : '';
+        $password = isset($body['password']) ? (string)$body['password'] : '';
+        $otp = isset($body['otp']) ? trim($body['otp']) : '';
+        $remember = !empty($body['remember']);
+        $device = $body['device'] ?? '';
+        $location = $body['location'] ?? '';
+        $loginTime = $body['loginTime'] ?? (new DateTime())->format(DateTime::ATOM);
+
+        if (!$email || !$password) {
+            json_out(['success'=>false,'error'=>'Email and password required.'],400);
+        }
+
+        // look up user by email
+        [$uc,$ur,$ue] = $supabase->rest('GET', '/rest/v1/users', null, "select=*,metadata,hashed_password,password_hash,avatar_url,photo_url,name,full_name,email,id&email=eq." . rawurlencode($email) . "&limit=1", true);
+        if ($uc !== 200) {
+            error_log("login: user lookup failed ($uc): " . substr($ur,0,400));
+            json_out(['success'=>false,'error'=>'Invalid credentials'],401);
+        }
+        $users = json_decode($ur, true);
+        if (empty($users) || !is_array($users)) {
+            json_out(['success'=>false,'error'=>'Invalid credentials'],401);
+        }
+        $user = $users[0];
+
+        // find candidate password field names
+        $hashed = $user['hashed_password'] ?? $user['password_hash'] ?? $user['password'] ?? '';
+        if (!$hashed) {
+            // no password stored
+            json_out(['success'=>false,'error'=>'Invalid credentials'],401);
+        }
+
+        // verify bcrypt
+        $ok = false;
+        try {
+            if (password_verify($password, $hashed)) $ok = true;
+            // password needs rehash? optionally handle with password_needs_rehash
+        } catch (Exception $e) {
+            error_log("login: password_verify error: " . $e->getMessage());
+        }
+        if (!$ok) {
+            json_out(['success'=>false,'error'=>'Invalid credentials'],401);
+        }
+
+        // check two-factor (simple backup-code flow)
+        [$tfc,$tfr,$tfe] = $supabase->rest('GET', '/rest/v1/two_factor', null, "select=*&user_id=eq." . rawurlencode($user['id']) . "&enabled=eq.true&limit=1", true);
+        $needs2FA = false;
+        $twoFactorSecret = null;
+        if ($tfc === 200) {
+            $trows = json_decode($tfr, true);
+            if (!empty($trows) && is_array($trows)) {
+                $needs2FA = true;
+                $twoFactorSecret = $trows[0]['secret'] ?? null;
+            }
+        }
+
+        if ($needs2FA && !$otp) {
+            // create a short lived backup code and email it (best-effort)
+            try {
+                $code = str_pad((string)random_int(100000, 999999), 6, '0', STR_PAD_LEFT);
+                $backupId = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback());
+                $expiresAt = (new DateTime())->add(new DateInterval('PT5M'))->format(DateTime::ATOM); // 5 minutes
+                $insert = [
+                    'id' => $backupId,
+                    'user_id' => $user['id'],
+                    'code' => $code,
+                    'expires_at' => $expiresAt,
+                    'used' => false,
+                    'created_at' => (new DateTime())->format(DateTime::ATOM)
+                ];
+                $supabase->rest('POST', '/rest/v1/backup_codes', $insert, '', true, ['Prefer'=>'return=representation']);
+                // send email via Brevo (best-effort)
+                try {
+                    send_brevo_call($user['email'], getenv('BREVO_2FA_TEMPLATE_ID') ?: 9, [
+                        'FIRSTNAME' => explode(' ', trim($user['name'] ?? $user['full_name'] ?? ''))[0] ?? '',
+                        'OTP_CODE' => $code,
+                        'DEVICE' => $device ?: 'Unknown',
+                        'LOCATION' => $location ?: '',
+                        'LOGIN_TIME' => $loginTime,
+                        'SITE_NAME' => $SITE_NAME,
+                        'year' => date('Y')
+                    ]);
+                } catch (Exception $e) { error_log('Brevo 2FA send error: ' . $e->getMessage()); }
+            } catch (Exception $e) {
+                error_log('2FA backup code creation error: ' . $e->getMessage());
+            }
+            json_out(['success'=>true, 'needs_2fa' => true, 'message' => '2FA required. Check your email for an OTP or enter backup code.']);
+        }
+
+        if ($needs2FA && $otp) {
+            // check backup_codes table for code match
+            [$bc,$br,$be] = $supabase->rest('GET', '/rest/v1/backup_codes', null, "select=*&user_id=eq." . rawurlencode($user['id']) . "&code=eq." . rawurlencode($otp) . "&used=eq.false&expires_at=gt." . rawurlencode((new DateTime())->format(DateTime::ATOM)) . "&limit=1", true);
+            $ok2 = false;
+            if ($bc === 200) {
+                $brows = json_decode($br, true);
+                if (!empty($brows)) {
+                    $ok2 = true;
+                    // mark used
+                    try {
+                        $supabase->rest('PATCH', '/rest/v1/backup_codes', ['used'=>true], "id=eq." . rawurlencode($brows[0]['id']), true);
+                    } catch (Exception $ex) { error_log('Failed to mark backup code used: ' . $ex->getMessage()); }
+                }
+            }
+            if (!$ok2) {
+                // could have TOTP verification here if you add a library
+                json_out(['success'=>false,'error'=>'Invalid 2FA/OTP'],401);
+            }
+        }
+
+        // create session token
+        $sessionToken = gen_token_urlsafe(36);
+        $sessionId = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback());
+        $expiresInterval = $remember ? new DateInterval('P30D') : new DateInterval('P1D');
+        $expiresAtDt = (new DateTime())->add($expiresInterval);
+        $expiresAt = $expiresAtDt->format(DateTime::ATOM);
+
+        $clientIp = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['HTTP_CLIENT_IP'] ?? $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
+
+        $sess = [
+            'id' => $sessionId,
+            'user_id' => $user['id'],
+            'token' => $sessionToken,
+            'expires_at' => $expiresAt,
+            'user_agent' => $userAgent,
+            'ip' => $clientIp,
+            'device' => $device ?: null,
+            'location' => $location ?: null,
+            'login_time' => $loginTime,
+            'created_at' => (new DateTime())->format(DateTime::ATOM)
+        ];
+
+        [$sic,$sir,$sie] = $supabase->rest('POST', '/rest/v1/sessions', $sess, '', true, ['Prefer'=>'return=representation']);
+        if ($sic < 200 || $sic >= 300) {
+            error_log("login: failed to insert session ($sic) resp=" . substr($sir,0,400));
+            // do not abort login — return token anyway (best-effort)
+        }
+
+        // try to generate JWT if secret and library exist
+        $jwtToken = null;
+        if ($JWT_SECRET) {
+            try {
+                if (class_exists('\Firebase\JWT\JWT')) {
+                    $payload = [
+                        'sub' => $user['id'],
+                        'email' => $user['email'],
+                        'user_metadata' => [
+                            'full_name' => $user['full_name'] ?? ($user['name'] ?? $user['email']),
+                            'name' => $user['name'] ?? $user['email'],
+                            'first_name' => explode(' ', $user['name'] ?? $user['full_name'] ?? '')[0] ?? '',
+                            'photo_url' => $user['avatar_url'] ?? $user['photo_url'] ?? null,
+                            'avatar_url' => $user['avatar_url'] ?? $user['photo_url'] ?? null
+                        ],
+                        'iat' => time(),
+                        'exp' => time() + (int)max(60*60*24, ($remember ? 60*60*24*30 : 60*60*24))
+                    ];
+                    \Firebase\JWT\JWT::$leeway = 60;
+                    $jwtToken = \Firebase\JWT\JWT::encode($payload, $JWT_SECRET, 'HS256');
+                } else {
+                    // no Firebase\JWT: build a simple JWT (not recommended for production) - fallback skip
+                    $jwtToken = null;
+                }
+            } catch (Exception $e) {
+                error_log('JWT generation failed: ' . $e->getMessage());
+                $jwtToken = null;
+            }
+        }
+
+        // log activity (best-effort)
+        try {
+            $logPayload = [
+                'user_id' => $user['id'],
+                'action' => 'login',
+                'ip_address' => $clientIp,
+                'device_info' => $device ?: null,
+                'location' => $location ?: null,
+                'user_agent' => $userAgent,
+                'metadata' => json_encode(['login_time' => $loginTime]),
+                'created_at' => (new DateTime())->format(DateTime::ATOM)
+            ];
+            $supabase->rest('POST', '/rest/v1/user_activity_logs', $logPayload, '', true);
+        } catch (Exception $e) {
+            error_log('Failed to log user activity: ' . $e->getMessage());
+        }
+
+        // send Brevo login notification (best-effort)
+        try {
+            if ($BREVO_KEY) {
+                send_brevo_call($user['email'], getenv('BREVO_LOGIN_TEMPLATE_ID') ?: 7, [
+                    'FIRSTNAME' => explode(' ', trim($user['name'] ?? $user['full_name'] ?? ''))[0] ?? '',
+                    'DEVICE' => $device ?: 'Unknown',
+                    'LOCATION' => $location ?: '',
+                    'LOGIN_TIME' => $loginTime,
+                    'SITE_NAME' => $SITE_NAME,
+                    'year' => date('Y')
+                ]);
+            }
+        } catch (Exception $e) { error_log('Brevo login send failed: ' . $e->getMessage()); }
+
+        $safeUser = ['id' => $user['id'], 'email' => $user['email'], 'name' => $user['name'] ?? $user['full_name'] ?? null];
+
+        $respOut = ['success' => true, 'token' => $sessionToken, 'user' => $safeUser, 'expires_at' => $expiresAt];
+        if ($jwtToken) $respOut['jwt'] = $jwtToken;
+
+        json_out($respOut, 200);
         break;
 
     // ---------------- NEW: edit_member (converted) ----------------
@@ -364,7 +600,7 @@ switch ($action) {
             $ext = pathinfo($name, PATHINFO_EXTENSION) ?: 'jpg';
             $isVideo = in_array(strtolower($ext), ['mp4','webm','mov','avi','m4v']);
             $bucket = $isVideo ? ($POST_VIDEO_BUCKET) : ($POST_IMAGE_BUCKET);
-            $path = Uuid::uuid4()->toString() . '.' . $ext;
+            $path = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback()) . '.' . $ext;
             [$uc,$ur,$ue] = $supabase->storagePut($bucket, $path, $bin, $type ?: ($isVideo ? 'video/mp4' : 'image/jpeg'));
             if ($uc < 200 || $uc >= 300) {
                 error_log("Upload failed: $uc $ur $ue");
@@ -383,7 +619,7 @@ switch ($action) {
         }
 
         // create post record - use UUID for id
-        $postId = Uuid::uuid4()->toString();
+        $postId = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback());
         $authorInfo = null;
         [$cu,$ru,$eu] = $supabase->rest('GET', '/rest/v1/users', null, "select=user_metadata,full_name,name,email,id&maybeSingle=true&id=eq." . rawurlencode($userId), true);
         if ($cu === 200) { $u = json_decode($ru, true); if (is_array($u)) $authorInfo = $u; }
@@ -820,8 +1056,8 @@ switch ($action) {
         }
 
         // fallback: create password reset entry and send email
-        $resetId = Uuid::uuid4()->toString();
-        $resetToken = Uuid::uuid4()->toString();
+        $resetId = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback());
+        $resetToken = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback());
         $expiresAt = date('c', time() + 3600);
         $targetEmail = strtolower(trim($emailFromPayload ?: ''));
 
@@ -924,7 +1160,7 @@ switch ($action) {
         if (!$userId) { error_log('user upsert failed for ' . $email); http_response_code(500); echo 'User upsert failed'; exit; }
 
         // create session token in sessions table - use UUID token
-        $tokenVal = Uuid::uuid4()->toString();
+        $tokenVal = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback());
         $sess = ['user_id'=>$userId,'token'=>$tokenVal,'created_at'=>$now,'expires_at'=>date('c', time()+60*60*24*30)];
         $supabase->rest('POST', '/rest/v1/sessions', $sess, '', true);
 
@@ -987,7 +1223,7 @@ switch ($action) {
         if (!$userId) { error_log('user upsert failed for ' . $email); http_response_code(500); echo 'User upsert failed'; exit; }
 
         // create session token in sessions table - UUID token
-        $tokenVal = Uuid::uuid4()->toString();
+        $tokenVal = (class_exists('Ramsey\Uuid\Uuid') ? Uuid::uuid4()->toString() : uuid_v4_fallback());
         $sess = ['user_id'=>$userId,'token'=>$tokenVal,'created_at'=>$now,'expires_at'=>date('c', time()+60*60*24*30)];
         $supabase->rest('POST', '/rest/v1/sessions', $sess, '', true);
 
