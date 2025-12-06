@@ -1,0 +1,119 @@
+{
+  "name": "Umu-Oyi — Umugwuanyi-Oyi Family Heritage",
+  "short_name": "Umu-Oyi",
+  "description": "Preserving the royal legacy of the Umugwuanyi-Oyi family. Connect with kin, explore our ancestral tree, share memories, and honor our traditions.",
+  "start_url": "/portal.html",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f0b16",
+  "theme_color": "#0f0b16",
+  "categories": ["social", "lifestyle", "education"],
+  "lang": "en",
+  "dir": "ltr",
+  "icons": [
+    {
+      "src": "/assets/icons/icon-72.png",
+      "sizes": "72x72",
+      "type": "image/png",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "/assets/icons/icon-96.png",
+      "sizes": "96x96",
+      "type": "image/png",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "/assets/icons/icon-128.png",
+      "sizes": "128x128",
+      "type": "image/png",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "/assets/icons/icon-144.png",
+      "sizes": "144x144",
+      "type": "image/png",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "/assets/icons/icon-152.png",
+      "sizes": "152x152",
+      "type": "image/png",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "/assets/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "/assets/icons/icon-384.png",
+      "sizes": "384x384",
+      "type": "image/png",
+      "purpose": "maskable any"
+    },
+    {
+      "src": "/assets/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable any"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/assets/screenshots/mobile-1.jpg",
+      "sizes": "390x844",
+      "type": "image/jpeg",
+      "form_factor": "narrow",
+      "label": "Umu-Oyi Mobile Home"
+    },
+    {
+      "src": "/assets/screenshots/desktop-1.jpg",
+      "sizes": "1920x1080",
+      "type": "image/jpeg",
+      "form_factor": "wide",
+      "label": "Umu-Oyi Family Tree View"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Family Tree",
+      "url": "/family-tree.html",
+      "description": "Explore our ancestral lineage",
+      "icons": [
+        {
+          "src": "/assets/icons/tree-96.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Messages",
+      "url": "/chat.html",
+      "description": "Chat with family members",
+      "icons": [
+        {
+          "src": "/assets/icons/chat-96.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Post Update",
+      "url": "/post.html",
+      "description": "Share a new update",
+      "icons": [
+        {
+          "src": "/assets/icons/post-96.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    }
+  ],
+  "prefer_related_applications": false
+}
