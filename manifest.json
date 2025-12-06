@@ -1,16 +1,16 @@
 {
   "name": "Umu-Oyi — Umugwuanyi-Oyi Family Heritage",
   "short_name": "Umu-Oyi",
-  "description": "Preserving the royal legacy of the Umugwuanyi-Oyi family. Connect with kin, explore our ancestral tree, share memories, and honor our traditions.",
+  "description": "Preserving the royal legacy of the Umugwuanyi-Oyi family. Connect, share memories, explore our ancestral tree and honor our traditions.",
   "start_url": "/portal.html",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait-primary",
   "background_color": "#0f0b16",
   "theme_color": "#0f0b16",
-  "categories": ["social", "lifestyle", "education"],
   "lang": "en",
   "dir": "ltr",
+  "categories": ["social", "lifestyle", "education", "family"],
   "icons": [
     {
       "src": "/assets/icons/icon-72.png",
@@ -63,18 +63,18 @@
   ],
   "screenshots": [
     {
-      "src": "/assets/screenshots/mobile-1.jpg",
+      "src": "/assets/screenshots/mobile-home.jpg",
       "sizes": "390x844",
       "type": "image/jpeg",
       "form_factor": "narrow",
       "label": "Umu-Oyi Mobile Home"
     },
     {
-      "src": "/assets/screenshots/desktop-1.jpg",
+      "src": "/assets/screenshots/desktop-tree.jpg",
       "sizes": "1920x1080",
       "type": "image/jpeg",
       "form_factor": "wide",
-      "label": "Umu-Oyi Family Tree View"
+      "label": "Umu-Oyi Family Tree"
     }
   ],
   "shortcuts": [
@@ -82,37 +82,19 @@
       "name": "Family Tree",
       "url": "/family-tree.html",
       "description": "Explore our ancestral lineage",
-      "icons": [
-        {
-          "src": "/assets/icons/tree-96.png",
-          "sizes": "96x96",
-          "type": "image/png"
-        }
-      ]
+      "icons": [{ "src": "/assets/icons/tree-96.png", "sizes": "96x96" }]
     },
     {
       "name": "Messages",
       "url": "/chat.html",
-      "description": "Chat with family members",
-      "icons": [
-        {
-          "src": "/assets/icons/chat-96.png",
-          "sizes": "96x96",
-          "type": "image/png"
-        }
-      ]
+      "description": "Chat with family",
+      "icons": [{ "src": "/assets/icons/chat-96.png", "sizes": "96x96" }]
     },
     {
-      "name": "Post Update",
+      "name": "Share Post",
       "url": "/post.html",
-      "description": "Share a new update",
-      "icons": [
-        {
-          "src": "/assets/icons/post-96.png",
-          "sizes": "96x96",
-          "type": "image/png"
-        }
-      ]
+      "description": "Create a new post",
+      "icons": [{ "src": "/assets/icons/post-96.png", "sizes": "96x96" }]
     }
   ],
   "prefer_related_applications": false
