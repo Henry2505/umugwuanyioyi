@@ -12,9 +12,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-require_once 'vendor/autoload.php'; // keep if you have composer libs; OK if not
-
-use Firebase\JWT\JWT; // if available
+require_once __DIR__ . '/vendor/autoload.php'; // composer autoload
+use App\SupabaseClient;
+use Ramsey\Uuid\Uuid;
 
 // --------- CONFIG / ENV ---------
 $SUPABASE_URL      = rtrim(getenv('SUPABASE_URL') ?: '', '/');
@@ -44,6 +44,15 @@ $TURN_PASS         = getenv('TURN_PASS') ?: '';
 if (!$SUPABASE_URL) {
     http_response_code(500);
     echo json_encode(['error' => 'SUPABASE_URL not set']);
+    exit;
+}
+
+// instantiate PSR-4 Supabase helper
+try {
+    $supabase = new SupabaseClient($SUPABASE_URL, $SERVICE_KEY, $ANON_KEY);
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Supabase client init failed', 'detail' => $e->getMessage()]);
     exit;
 }
 
@@ -99,63 +108,14 @@ function get_bearer_token() {
     return null;
 }
 
-// Minimal supabase REST helper (curl)
-function supabase_rest($method, $path, $body = null, $queryStr = '', $useServiceKey = true, $extraHeaders = []) {
-    global $SUPABASE_URL, $SERVICE_KEY, $ANON_KEY;
-    $url = rtrim($SUPABASE_URL, '/') . $path . ($queryStr ? '?' . $queryStr : '');
-    $ch = curl_init($url);
-    $headers = [];
-    if ($useServiceKey && $SERVICE_KEY) {
-        $headers[] = 'apikey: ' . $SERVICE_KEY;
-        $headers[] = 'Authorization: Bearer ' . $SERVICE_KEY;
-    } else if ($ANON_KEY) {
-        $headers[] = 'apikey: ' . $ANON_KEY;
-    }
-    foreach ($extraHeaders as $k => $v) $headers[] = "$k: $v";
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-    if ($body !== null) {
-        $json = is_string($body) ? $body : json_encode($body);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
-        $headers[] = 'Content-Type: application/json';
-    }
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 25);
-    $resp = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err = curl_error($ch);
-    curl_close($ch);
-    return [$code, $resp, $err];
-}
-
 // Helper: upload binary to supabase storage via PUT to /storage/v1/object/<bucket>/<path>
-function supabase_storage_put($bucket, $path, $binary, $contentType = 'application/octet-stream') {
-    global $SUPABASE_URL, $SERVICE_KEY;
-    $url = rtrim($SUPABASE_URL, '/') . "/storage/v1/object/{$bucket}/{$path}";
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $binary);
-    $headers = [
-        'Content-Type: ' . $contentType,
-    ];
-    if ($SERVICE_KEY) {
-        $headers[] = 'apikey: ' . $SERVICE_KEY;
-        $headers[] = 'Authorization: Bearer ' . $SERVICE_KEY;
-    }
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 60);
-    $resp = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err = curl_error($ch);
-    curl_close($ch);
-    return [$code, $resp, $err];
-}
+// replaced earlier supabase_storage_put wrapper with method on $supabase
+// We'll use $supabase->storagePut($bucket, $path, $binary, $contentType)
 
 // Helper: compute sha256 hex
 function sha256_hex($s) { return hash('sha256', $s); }
 
-// Helper: generate random key (url-safe)
+// Helper: generate random key (url-safe) - keep this as-is for API key prefixes
 function gen_key_plain() {
     $raw = base64_encode(random_bytes(32));
     $raw = str_replace(['+','/','='], ['-','_',''], $raw);
@@ -172,15 +132,6 @@ function redirect_with_cookie($location, $cookieName, $cookieValue, $maxAge = 25
     exit;
 }
 
-// Helper: build public storage URL (like Supabase storage public path)
-function build_public_storage_url($supabaseUrl, $bucket, $path) {
-    if (empty($supabaseUrl) || empty($bucket) || empty($path)) return null;
-    $base = rtrim($supabaseUrl, '/');
-    // remove leading slashes
-    $cleanedPath = preg_replace('#^/+?#', '', $path);
-    return "{$base}/storage/v1/object/public/{$bucket}/" . rawurlencode($cleanedPath);
-}
-
 // ---------- ROUTING ----------
 $action = $_REQUEST['action'] ?? $_GET['action'] ?? $_POST['action'] ?? $_GET['q'] ?? '';
 
@@ -192,13 +143,13 @@ switch ($action) {
     case 'current_user':
         $token = get_bearer_token();
         if (!$token) json_out(['error'=>'Unauthorized'],401);
-        // session lookup
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+        // session lookup (uses $supabase->rest)
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
         if ($c !== 200) json_out(['error'=>'Invalid token'],401);
         $sdata = json_decode($r, true);
         $userId = $sdata[0]['user_id'] ?? null;
         if (!$userId) json_out(['error'=>'Invalid token'],401);
-        [$c2,$r2,$e2] = supabase_rest('GET', '/rest/v1/users', null, "select=id,email,full_name,name,photo_url,avatar_url,phone,bio,verified,metadata,created_at&id=eq." . rawurlencode($userId), true);
+        [$c2,$r2,$e2] = $supabase->rest('GET', '/rest/v1/users', null, "select=id,email,full_name,name,photo_url,avatar_url,phone,bio,verified,metadata,created_at&id=eq." . rawurlencode($userId), true);
         if ($c2 !== 200) json_out(['error'=>'User not found'],404);
         $u = json_decode($r2, true)[0] ?? null;
         json_out($u);
@@ -222,13 +173,13 @@ switch ($action) {
         if ($authHeader && preg_match('/Bearer\s+(.+)/i',$authHeader,$m)) {
             $token = trim($m[1]);
             // try session
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
             if ($c === 200) {
                 $s = json_decode($r, true)[0] ?? null;
                 if ($s && $s['user_id']) {
                     $userId = $s['user_id'];
                     // check admin role on users table user_metadata.role OR ADMIN_EMAILS env
-                    [$c2,$r2,$e2] = supabase_rest('GET', '/rest/v1/users', null, "select=id,email,metadata&id=eq." . rawurlencode($userId) . "&limit=1", true);
+                    [$c2,$r2,$e2] = $supabase->rest('GET', '/rest/v1/users', null, "select=id,email,metadata&id=eq." . rawurlencode($userId) . "&limit=1", true);
                     if ($c2 === 200) {
                         $u = json_decode($r2, true)[0] ?? null;
                         $role = $u['metadata']['role'] ?? ($u['metadata']['app_metadata']['role'] ?? null);
@@ -253,7 +204,7 @@ switch ($action) {
         }
         $updateData['updated_at'] = date('c');
 
-        [$code,$resp,$err] = supabase_rest('PATCH', '/rest/v1/members', $updateData, "external_ref=eq." . rawurlencode($external_ref), true, ['Prefer'=>'return=representation']);
+        [$code,$resp,$err] = $supabase->rest('PATCH', '/rest/v1/members', $updateData, "external_ref=eq." . rawurlencode($external_ref), true, ['Prefer'=>'return=representation']);
         if ($code < 200 || $code >= 300) {
             error_log("edit_member error ($code): $resp $err");
             json_out(['error'=>'Update failed','detail'=>$resp],502);
@@ -293,7 +244,7 @@ switch ($action) {
             $userId = (string)$body['userId'];
         } else {
             // validate session from sessions table
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
             if ($c !== 200) json_out(['error'=>'Unauthorized'],401);
             $s = json_decode($r, true)[0] ?? null;
             if (!$s || empty($s['user_id'])) json_out(['error'=>'Unauthorized'],401);
@@ -302,7 +253,7 @@ switch ($action) {
 
         // delete where id=notifId and recipient_id=userId
         $filter = "id=eq." . rawurlencode($notifId) . "&recipient_id=eq." . rawurlencode($userId);
-        [$c,$r,$e] = supabase_rest('DELETE', '/rest/v1/notifications', null, $filter, true);
+        [$c,$r,$e] = $supabase->rest('DELETE', '/rest/v1/notifications', null, $filter, true);
         if ($c < 200 || $c >= 300) {
             error_log("delete-notif failed ($c): $r $e");
             json_out(['error'=>'Delete failed','details'=> $r], 502);
@@ -326,17 +277,14 @@ switch ($action) {
         if (!$bucket) json_out(['error'=>'bucket required'],400);
 
         // attempt to use Supabase Storage signed upload via REST: /storage/v1/object/sign - older/undocumented ports vary.
-        // If SUPABASE_SERVICE_KEY exists we can attempt to call the storage 'createSignedUploadUrl' route used by supabase-js client.
-        // If it fails, return public URL and null signedUploadUrl (caller can use direct upload with service key).
         $path = time() . '-' . bin2hex(random_bytes(6)) . '-' . preg_replace('/\s+/', '_', $filename);
-        // Try POST to /storage/v1/object/sign (not documented for all deployments; best-effort)
         $url = rtrim($SUPABASE_URL, '/') . "/storage/v1/object/sign/{$bucket}/{$path}";
         $ch = curl_init($url);
         $headers = [];
         if ($SERVICE_KEY) { $headers[] = 'apikey: ' . $SERVICE_KEY; $headers[] = 'Authorization: Bearer ' . $SERVICE_KEY; }
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers + ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array_merge($headers, ['Content-Type: application/json']));
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode(['expiresIn' => $expiry]));
         curl_setopt($ch, CURLOPT_TIMEOUT, 20);
         $resp = curl_exec($ch);
@@ -367,7 +315,7 @@ switch ($action) {
         if (!$token) json_out(['error'=>'Bearer token required'],401);
 
         // validate session: sessions table
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
         if ($c !== 200) json_out(['error'=>'Invalid token'],401);
         $s = json_decode($r, true)[0] ?? null;
         if (!$s || empty($s['user_id'])) json_out(['error'=>'Invalid token'],401);
@@ -416,8 +364,8 @@ switch ($action) {
             $ext = pathinfo($name, PATHINFO_EXTENSION) ?: 'jpg';
             $isVideo = in_array(strtolower($ext), ['mp4','webm','mov','avi','m4v']);
             $bucket = $isVideo ? ($POST_VIDEO_BUCKET) : ($POST_IMAGE_BUCKET);
-            $path = bin2hex(random_bytes(8)) . '.' . $ext;
-            [$uc,$ur,$ue] = supabase_storage_put($bucket, $path, $bin, $type ?: ($isVideo ? 'video/mp4' : 'image/jpeg'));
+            $path = Uuid::uuid4()->toString() . '.' . $ext;
+            [$uc,$ur,$ue] = $supabase->storagePut($bucket, $path, $bin, $type ?: ($isVideo ? 'video/mp4' : 'image/jpeg'));
             if ($uc < 200 || $uc >= 300) {
                 error_log("Upload failed: $uc $ur $ue");
                 json_out(['error'=>'Upload failed','detail'=>$ur],502);
@@ -434,10 +382,10 @@ switch ($action) {
             if ($sourcePath) $media_path = $sourcePath;
         }
 
-        // create post record
-        $postId = bin2hex(random_bytes(12));
+        // create post record - use UUID for id
+        $postId = Uuid::uuid4()->toString();
         $authorInfo = null;
-        [$cu,$ru,$eu] = supabase_rest('GET', '/rest/v1/users', null, "select=user_metadata,full_name,name,email,id&maybeSingle=true&id=eq." . rawurlencode($userId), true);
+        [$cu,$ru,$eu] = $supabase->rest('GET', '/rest/v1/users', null, "select=user_metadata,full_name,name,email,id&maybeSingle=true&id=eq." . rawurlencode($userId), true);
         if ($cu === 200) { $u = json_decode($ru, true); if (is_array($u)) $authorInfo = $u; }
         $payload = [
             'id' => $postId,
@@ -450,7 +398,7 @@ switch ($action) {
             'created_at' => date('c')
         ];
 
-        [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/posts', $payload, '', true, ['Prefer'=>'return=representation']);
+        [$ic,$ir,$ie] = $supabase->rest('POST', '/rest/v1/posts', $payload, '', true, ['Prefer'=>'return=representation']);
         if ($ic < 200 || $ic >= 300) {
             error_log("Insert failed: $ic $ir $ie");
             json_out(['error'=>'Save failed','detail'=>$ir],502);
@@ -477,202 +425,6 @@ switch ($action) {
         } catch (Exception $e) { /* ignore */ }
 
         json_out(['success'=>true, 'post'=>$post]);
-        break;
-
-    // ---------------- NEW: add_comment (converted from add-comment.js) ----------------
-    case 'add_comment':
-    case 'add-comment':
-    case 'addComment':
-        $method = $_SERVER['REQUEST_METHOD'];
-        if ($method === 'OPTIONS') { http_response_code(204); exit; }
-        if ($method !== 'POST') json_out(['error'=>'Only POST allowed'],405);
-
-        try {
-            $body = get_json_body();
-            // discover token
-            $token = get_bearer_token();
-            if (!$token) {
-                $cookieHeader = $_SERVER['HTTP_COOKIE'] ?? '';
-                $possible = ['umuy_token','sb-jwt-token','sb-access-token','umuy_session','access_token','token'];
-                foreach ($possible as $n) {
-                    $v = parse_cookie_value($cookieHeader, $n);
-                    if ($v) { $token = $v; break; }
-                }
-            }
-            if (!$token) json_out(['error'=>'Unauthorized','detail'=>'Missing token'],401);
-
-            // validate session via sessions table
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id,created_at&token=eq." . rawurlencode($token) . "&limit=1", true);
-            if ($c !== 200) json_out(['error'=>'Unauthorized','detail'=>'Invalid or expired session'],401);
-            $sess = json_decode($r, true)[0] ?? null;
-            if (!$sess || empty($sess['user_id'])) json_out(['error'=>'Unauthorized','detail'=>'Invalid session'],401);
-            $userId = $sess['user_id'];
-
-            $postId = isset($body['postId']) ? trim($body['postId']) : (isset($body['post_id']) ? trim($body['post_id']) : '');
-            $content = isset($body['content']) ? trim($body['content']) : '';
-            $mediaUrl = isset($body['media_url']) ? trim($body['media_url']) : (isset($body['mediaUrl']) ? trim($body['mediaUrl']) : '');
-            $mediaPath = isset($body['media_path']) ? trim($body['media_path']) : (isset($body['mediaPath']) ? trim($body['mediaPath']) : '');
-            $mediaType = isset($body['media_type']) ? trim($body['media_type']) : (isset($body['mediaType']) ? trim($body['mediaType']) : '');
-
-            if (!$postId) json_out(['error'=>'postId required'],400);
-            if (!$content && !$mediaUrl && !$mediaPath) json_out(['error'=>'content or media required'],400);
-
-            // get author name/avatar from users table if available
-            [$uc,$ur,$ue] = supabase_rest('GET', '/rest/v1/users', null, "select=full_name,name,photo_url,user_metadata&id=eq." . rawurlencode($userId) . "&limit=1", true);
-            $authorName = $userId;
-            $authorAvatar = null;
-            if ($uc === 200 && $ur) {
-                $u = json_decode($ur, true)[0] ?? null;
-                if ($u) {
-                    $authorName = $u['full_name'] ?? $u['name'] ?? $u['email'] ?? $userId;
-                    if (!empty($u['photo_url'])) $authorAvatar = $u['photo_url'];
-                    else if (!empty($u['user_metadata']) && is_array($u['user_metadata'])) {
-                        $authorAvatar = $u['user_metadata']['avatar_url'] ?? $u['user_metadata']['photo_url'] ?? $authorAvatar;
-                    }
-                }
-            }
-
-            $finalMediaUrl = $mediaUrl;
-            if (empty($finalMediaUrl) && !empty($mediaPath)) {
-                // guess bucket from mediaPath or mediaType
-                $parts = preg_split('#/+?#', $mediaPath, -1, PREG_SPLIT_NO_EMPTY);
-                $bucket = '';
-                $path = $mediaPath;
-                if (count($parts) > 1) {
-                    $bucket = array_shift($parts);
-                    $path = implode('/', $parts);
-                } else {
-                    // choose bucket based on mediaType / extension
-                    if (stripos($mediaType, 'video/') === 0) $bucket = 'comment-videos';
-                    else {
-                        $ext = strtolower(pathinfo($mediaPath, PATHINFO_EXTENSION));
-                        if (in_array($ext, ['mp4','webm','mov','m4v','ogg','avi'])) $bucket = 'comment-videos';
-                        else $bucket = 'comment-photos';
-                        $path = $mediaPath;
-                    }
-                }
-                $finalMediaUrl = build_public_storage_url($SUPABASE_URL, $bucket, $path);
-            }
-
-            $commentId = bin2hex(random_bytes(16));
-            $createdAt = date('c');
-
-            $rec = [
-                'id' => $commentId,
-                'post_id' => $postId,
-                'author_id' => $userId,
-                'author_name' => $authorName,
-                'author_avatar' => $authorAvatar ?: null,
-                'content' => $content ?: null,
-                'media_url' => $finalMediaUrl ?: null,
-                'media_path' => $mediaPath ?: null,
-                'media_type' => $mediaType ?: null,
-                'created_at' => $createdAt
-            ];
-
-            [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/comments', $rec, '', true, ['Prefer'=>'return=representation']);
-            if ($ic < 200 || $ic >= 300) {
-                error_log("add_comment insert failed: $ic $ir $ie");
-                // still return 502 with upstream detail
-                json_out(['error'=>'Add comment failed','detail'=>$ir],502);
-            }
-
-            $saved = json_decode($ir, true);
-            $savedComment = is_array($saved) && count($saved) ? $saved[0] : $rec;
-
-            // try insert event
-            try {
-                $evt = [
-                    'id' => bin2hex(random_bytes(12)),
-                    'type' => 'comment',
-                    'recipient_id' => null,
-                    'sender_id' => $userId,
-                    'payload' => json_encode(['post_id'=>$postId,'comment_id'=>$savedComment['id'] ?? $commentId,'excerpt'=>mb_substr($content,0,200)]),
-                    'created_at' => $createdAt
-                ];
-                supabase_rest('POST', '/rest/v1/events', $evt, '', true);
-            } catch (Exception $e) {
-                // ignore
-            }
-
-            json_out(['success'=>true,'comment'=>$savedComment]);
-        } catch (Exception $ex) {
-            error_log('add_comment error: ' . $ex->getMessage());
-            json_out(['error'=>'Internal server error','detail'=>$ex->getMessage()],500);
-        }
-        break;
-
-    // ---------------- NEW: add_member (converted from add_member.js) ----------------
-    case 'add_member':
-    case 'add-member':
-    case 'addMember':
-        $method = $_SERVER['REQUEST_METHOD'];
-        if ($method === 'OPTIONS') { http_response_code(204); exit; }
-        if ($method !== 'POST') json_out(['error'=>'POST only'],405);
-
-        try {
-            $headers = getallheaders();
-            $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
-            $internalSecretHeader = $headers['X-Internal-Secret'] ?? $headers['x-internal-secret'] ?? '';
-            $allowWithoutToken = $internalSecretHeader && ($internalSecretHeader === $INTERNAL_SECRET);
-
-            // token extraction: Bearer or internal secret
-            $token = null;
-            if ($authHeader && preg_match('/Bearer\s+(.+)/i',$authHeader,$m)) $token = trim($m[1]);
-            if (!$token && $allowWithoutToken) $token = 'INTERNAL';
-
-            if (!$token) json_out(['error'=>'Authorization required'],401);
-
-            $body = get_json_body();
-            $required = ['name','external_ref'];
-            foreach ($required as $r) {
-                if (empty($body[$r])) json_out(['error'=>"$r required"],400);
-            }
-
-            $payload = [
-                'id' => bin2hex(random_bytes(16)),
-                'external_ref' => $body['external_ref'],
-                'name' => $body['name'],
-                'dob' => $body['dob'] ?? null,
-                'gender' => $body['gender'] ?? null,
-                'bio' => $body['bio'] ?? null,
-                'parent_external_ref' => $body['parent_external_ref'] ?? null,
-                'phone' => $body['phone'] ?? null,
-                'submitted_by_email' => $body['submitted_by_email'] ?? null,
-                'photo_url' => $body['photo_url'] ?? null,
-                'status' => $body['status'] ?? 'active',
-                'verified' => isset($body['verified']) ? boolval($body['verified']) : false,
-                'online' => isset($body['online']) ? boolval($body['online']) : false,
-                'avatar' => $body['avatar'] ?? ($body['photo_url'] ?? null),
-                'last_seen' => date('c'),
-                'created_at' => date('c'),
-                'updated_at' => date('c')
-            ];
-
-            // If internal secret present, allow insert without service key token check.
-            // Otherwise require SERVICE_KEY to be present (server-to-server) or allow if token == SERVICE_KEY
-            if ($token !== 'INTERNAL' && $SERVICE_KEY && $token !== $SERVICE_KEY) {
-                // try validate token via sessions table (i.e., token belongs to a user)
-                [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
-                // If not valid and the token isn't the service key, reject
-                if ($c !== 200) json_out(['error'=>'Authorization required'],401);
-            }
-
-            // Insert using service key ideally
-            $useService = true;
-            [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/members', $payload, '', $useService, ['Prefer'=>'return=representation']);
-            if ($ic < 200 || $ic >= 300) {
-                $detail = $ir;
-                error_log("add_member insert failed: $ic $ir $ie");
-                json_out(['error'=>'Add failed','detail'=>$detail],502);
-            }
-            $added = json_decode($ir, true);
-            $row = is_array($added) && count($added) ? $added[0] : $payload;
-            json_out(['success'=>true,'member'=>$row]);
-        } catch (Exception $ex) {
-            error_log('add_member error: ' . $ex->getMessage());
-            json_out(['error'=>'Server error','detail'=>$ex->getMessage()],500);
-        }
         break;
 
     // ---------------- NEW: contact_submit ----------------
@@ -727,7 +479,7 @@ switch ($action) {
             'created_at'=>date('c')
         ];
 
-        [$c,$r,$e] = supabase_rest('POST', '/rest/v1/contact_messages', $record, '', true, ['Prefer'=>'return=representation']);
+        [$c,$r,$e] = $supabase->rest('POST', '/rest/v1/contact_messages', $record, '', true, ['Prefer'=>'return=representation']);
         if ($c < 200 || $c >= 300) {
             error_log("contact_submit supabase error $c: $r");
             json_out(['success'=>false,'error'=>'Database error','detail'=>$r],502);
@@ -757,7 +509,7 @@ switch ($action) {
             $userId = $_GET['user_id'] ?? null;
             if (!$userId) json_out(['error'=>'user_id required when using service key'],400);
         } else {
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
             if ($c !== 200) json_out(['error'=>'Unauthorized'],401);
             $s = json_decode($r, true)[0] ?? null;
             if (!$s || empty($s['user_id'])) json_out(['error'=>'Unauthorized'],401);
@@ -767,7 +519,7 @@ switch ($action) {
         $tries = ['oauth_connections','oauth_accounts','connected_services','user_oauth'];
         $services = [];
         foreach ($tries as $tbl) {
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/' . $tbl, null, "select=*&user_id=eq." . rawurlencode($userId), true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/' . $tbl, null, "select=*&user_id=eq." . rawurlencode($userId), true);
             if ($c === 200) {
                 $rows = json_decode($r, true);
                 if (is_array($rows)) {
@@ -780,7 +532,6 @@ switch ($action) {
                             'meta' => $row['meta'] ?? $row['raw'] ?? null
                         ];
                     }
-                    // found something - break (we still allow fallback to other tables if empty)
                     if (!empty($services)) break;
                 }
             }
@@ -810,14 +561,14 @@ switch ($action) {
         }
 
         // fetch claim by id and token
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/claims', null, "select=*&id=eq." . rawurlencode($claim_id) . "&token=eq." . rawurlencode($tokenParam) . "&status=eq.pending&limit=1", true);
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/claims', null, "select=*&id=eq." . rawurlencode($claim_id) . "&token=eq." . rawurlencode($tokenParam) . "&status=eq.pending&limit=1", true);
         if ($c !== 200) json_out(['success'=>false,'error'=>'Invalid or expired claim'],400);
         $claims = json_decode($r, true);
         if (empty($claims)) json_out(['success'=>false,'error'=>'Invalid or expired claim'],400);
         $claim = $claims[0];
         if (isset($claim['token_expires']) && strtotime($claim['token_expires']) < time()) json_out(['success'=>false,'error'=>'Token expired'],400);
 
-        // hash password (bcrypt) - requires ext sodium or password_hash (we use password_hash)
+        // hash password (bcrypt)
         $password_hash = password_hash($password, PASSWORD_BCRYPT);
 
         // Upload photo and video to storage
@@ -829,7 +580,7 @@ switch ($action) {
             $photo_bucket = 'claims-photo';
             $photo_fname = "claim-{$claim_id}-" . time() . '.' . preg_replace('/[^a-zA-Z0-9]/','',$photo_ext);
             $photo_bin = file_get_contents($photo['tmp_name']);
-            [$pc,$pr,$pe] = supabase_storage_put($photo_bucket, $photo_fname, $photo_bin, $photo['type'] ?? 'image/jpeg');
+            [$pc,$pr,$pe] = $supabase->storagePut($photo_bucket, $photo_fname, $photo_bin, $photo['type'] ?? 'image/jpeg');
             if ($pc < 200 || $pc >= 300) throw new Exception("Photo upload failed: $pr");
             $photo_url = rtrim($SUPABASE_URL,'/') . "/storage/v1/object/public/{$photo_bucket}/" . rawurlencode($photo_fname);
 
@@ -838,7 +589,7 @@ switch ($action) {
             $video_bucket = 'claims-video';
             $video_fname = "claim-{$claim_id}-" . time() . '.' . preg_replace('/[^a-zA-Z0-9]/','',$video_ext);
             $video_bin = file_get_contents($video['tmp_name']);
-            [$vc,$vr,$ve] = supabase_storage_put($video_bucket, $video_fname, $video_bin, $video['type'] ?? 'video/webm');
+            [$vc,$vr,$ve] = $supabase->storagePut($video_bucket, $video_fname, $video_bin, $video['type'] ?? 'video/webm');
             if ($vc < 200 || $vc >= 300) throw new Exception("Video upload failed: $vr");
             $video_url = rtrim($SUPABASE_URL,'/') . "/storage/v1/object/public/{$video_bucket}/" . rawurlencode($video_fname);
 
@@ -851,7 +602,7 @@ switch ($action) {
                 'status' => 'awaiting_approval',
                 'updated_at' => date('c')
             ];
-            [$uc,$ur,$ue] = supabase_rest('PATCH', '/rest/v1/claims', $updatePayload, "id=eq." . rawurlencode($claim_id), true, ['Prefer'=>'return=representation']);
+            [$uc,$ur,$ue] = $supabase->rest('PATCH', '/rest/v1/claims', $updatePayload, "id=eq." . rawurlencode($claim_id), true, ['Prefer'=>'return=representation']);
         } catch (Exception $ex) {
             error_log('claim-profile upload error: ' . $ex->getMessage());
             json_out(['success'=>false,'error'=>'File upload failed','detail'=> $ex->getMessage()],500);
@@ -860,7 +611,7 @@ switch ($action) {
         // fetch member name for personalization
         $memberName = '';
         try {
-            [$mc,$mr,$me] = supabase_rest('GET', '/rest/v1/members', null, "select=name&id=eq." . rawurlencode($claim['member_id']) . "&limit=1", true);
+            [$mc,$mr,$me] = $supabase->rest('GET', '/rest/v1/members', null, "select=name&id=eq." . rawurlencode($claim['member_id']) . "&limit=1", true);
             if ($mc === 200) {
                 $mrows = json_decode($mr, true);
                 if (!empty($mrows)) $memberName = $mrows[0]['name'] ?? '';
@@ -923,7 +674,7 @@ switch ($action) {
         if ($token && $SERVICE_KEY && $token === $SERVICE_KEY) $useServiceKey = true;
         // If token provided and valid session, prefer service key for writes
         if ($token && !$useServiceKey) {
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
             if ($c === 200 && $r) {
                 $s = json_decode($r, true)[0] ?? null;
                 if ($s && $s['user_id'] && $SERVICE_KEY) $useServiceKey = true;
@@ -939,7 +690,7 @@ switch ($action) {
             if (!$session_id || !$message) json_out(['error'=>'session_id and message required'],400);
 
             // find conversation
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/chat_conversations', null, "select=*&session_id=eq." . rawurlencode($session_id) . "&limit=1", $useServiceKey);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/chat_conversations', null, "select=*&session_id=eq." . rawurlencode($session_id) . "&limit=1", $useServiceKey);
             $convo = null;
             if ($c === 200) { $rows = json_decode($r, true); $convo = $rows[0] ?? null; }
             if (!$convo) {
@@ -952,7 +703,7 @@ switch ($action) {
                     'location'=>$meta['location'] ?? null,
                     'created_at'=>date('c')
                 ];
-                [$ci,$ri,$ei] = supabase_rest('POST', '/rest/v1/chat_conversations', $ins, '', $useServiceKey, ['Prefer'=>'return=representation']);
+                [$ci,$ri,$ei] = $supabase->rest('POST', '/rest/v1/chat_conversations', $ins, '', $useServiceKey, ['Prefer'=>'return=representation']);
                 if ($ci < 200 || $ci >= 300) json_out(['error'=>'Create convo failed','detail'=>$ri],500);
                 $crows = json_decode($ri, true);
                 $convo = $crows[0] ?? null;
@@ -966,12 +717,12 @@ switch ($action) {
                 'meta' => $meta,
                 'created_at' => date('c')
             ];
-            [$mi,$mr,$me] = supabase_rest('POST', '/rest/v1/chat_messages', $msgIns, '', $useServiceKey, ['Prefer'=>'return=representation']);
+            [$mi,$mr,$me] = $supabase->rest('POST', '/rest/v1/chat_messages', $msgIns, '', $useServiceKey, ['Prefer'=>'return=representation']);
             if ($mi < 200 || $mi >= 300) json_out(['error'=>'Message insert failed','detail'=>$mr],500);
             $mrows = json_decode($mr, true);
             $msg = $mrows[0] ?? null;
             // update convo last_message_at
-            supabase_rest('PATCH', '/rest/v1/chat_conversations', ['last_message_at'=>date('c'), 'unread_admin'=>true], "id=eq." . rawurlencode($convo['id']), $useServiceKey);
+            $supabase->rest('PATCH', '/rest/v1/chat_conversations', ['last_message_at'=>date('c'), 'unread_admin'=>true], "id=eq." . rawurlencode($convo['id']), $useServiceKey);
             json_out($msg);
         }
 
@@ -980,16 +731,16 @@ switch ($action) {
             $message = $body['message'] ?? '';
             if (!$reply_to || !$message) json_out(['error'=>'reply_to and message required'],400);
             $msgIns = ['conversation_id'=>$reply_to,'sender'=>'admin','message'=>$message,'created_at'=>date('c')];
-            [$mi,$mr,$me] = supabase_rest('POST', '/rest/v1/chat_messages', $msgIns, '', true, ['Prefer'=>'return=representation']);
+            [$mi,$mr,$me] = $supabase->rest('POST', '/rest/v1/chat_messages', $msgIns, '', true, ['Prefer'=>'return=representation']);
             if ($mi < 200 || $mi >= 300) json_out(['error'=>'Message insert failed','detail'=>$mr],500);
             // update convo
-            supabase_rest('PATCH', '/rest/v1/chat_conversations', ['last_message_at'=>date('c'),'unread_admin'=>false], "id=eq." . rawurlencode($reply_to), true);
+            $supabase->rest('PATCH', '/rest/v1/chat_conversations', ['last_message_at'=>date('c'),'unread_admin'=>false], "id=eq." . rawurlencode($reply_to), true);
             $mrows = json_decode($mr, true);
             json_out($mrows[0] ?? null);
         }
 
         if ($actionChat === 'fetch') {
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/chat_conversations', null, "select=*,chat_messages(*)&order=last_message_at.desc", true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/chat_conversations', null, "select=*,chat_messages(*)&order=last_message_at.desc", true);
             if ($c !== 200) json_out(['error'=>'Failed to fetch'],500);
             json_out(json_decode($r, true));
         }
@@ -997,9 +748,10 @@ switch ($action) {
         if ($actionChat === 'fetch_user') {
             $session_id = $body['session_id'] ?? null;
             if (!$session_id) json_out(['error'=>'session_id required'],400);
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/chat_conversations', null, "select=*,chat_messages(*)&session_id=eq." . rawurlencode($session_id) . "&limit=1", true);
-            if ($c === 200) json_out(json_decode($r, true)[0] ?? ['messages'=>[]]);
-            json_out(['error'=>'Failed to fetch'],500);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/chat_conversations', null, "select=*,chat_messages(*)&session_id=eq." . rawurlencode($session_id) . "&limit=1", true);
+            if ($c !== 200) json_out(['error'=>'Failed to fetch'],500);
+            $rows = json_decode($r, true);
+            json_out($rows[0] ?? ['messages'=>[]]);
         }
 
         json_out(['error'=>'Unknown action'],400);
@@ -1025,7 +777,7 @@ switch ($action) {
         $userId = null;
         if ($token) {
             // try session table first
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
             if ($c === 200) { $s = json_decode($r, true)[0] ?? null; if ($s && $s['user_id']) $userId = $s['user_id']; }
             // if not, try JWT decode (very best-effort)
             if (!$userId) {
@@ -1046,7 +798,7 @@ switch ($action) {
             }
         }
         if (!$userId && $emailFromPayload) {
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/users', null, "select=id&email=eq." . rawurlencode(strtolower($emailFromPayload)) . "&limit=1", true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/users', null, "select=id&email=eq." . rawurlencode(strtolower($emailFromPayload)) . "&limit=1", true);
             if ($c === 200) { $d = json_decode($r, true)[0] ?? null; if ($d && $d['id']) $userId = $d['id']; }
         }
 
@@ -1068,13 +820,13 @@ switch ($action) {
         }
 
         // fallback: create password reset entry and send email
-        $resetId = bin2hex(random_bytes(8));
-        $resetToken = bin2hex(random_bytes(24));
+        $resetId = Uuid::uuid4()->toString();
+        $resetToken = Uuid::uuid4()->toString();
         $expiresAt = date('c', time() + 3600);
         $targetEmail = strtolower(trim($emailFromPayload ?: ''));
 
         if (!$targetEmail && $userId) {
-            [$c,$r,$e] = supabase_rest('GET', '/rest/v1/users', null, "select=email&limit=1&id=eq." . rawurlencode($userId), true);
+            [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/users', null, "select=email&limit=1&id=eq." . rawurlencode($userId), true);
             if ($c === 200) { $u = json_decode($r, true)[0] ?? null; $targetEmail = $u['email'] ?? ''; }
         }
         if (!$targetEmail) json_out(['error'=>'Unable to determine email for reset; please request password reset from the signing page'],400);
@@ -1089,7 +841,7 @@ switch ($action) {
                 'used' => false,
                 'created_at' => date('c')
             ];
-            supabase_rest('POST', '/rest/v1/password_resets', $insertPayload, '', true);
+            $supabase->rest('POST', '/rest/v1/password_resets', $insertPayload, '', true);
         } catch (Exception $e) {}
 
         $appUrl = $APP_URL ?: 'https://umugwuanyi-oyi.netlify.app';
@@ -1148,7 +900,7 @@ switch ($action) {
         $now = date('c');
         $userRow = ['email'=>$email,'name'=>$name,'full_name'=>$name,'photo_url'=>$picture,'updated_at'=>$now,'metadata'=>json_encode(['oauth_provider'=>'google','oauth_profile'=>$profile])];
         // attempt find
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/users', null, "select=id,metadata&email=eq." . rawurlencode($email) . "&limit=1", true);
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/users', null, "select=id,metadata&email=eq." . rawurlencode($email) . "&limit=1", true);
         if ($c === 200 && !empty($r)) {
             $existing = json_decode($r, true)[0] ?? null;
             if ($existing && $existing['id']) {
@@ -1156,26 +908,25 @@ switch ($action) {
                 // merge metadata (best-effort)
                 $mergedMeta = json_decode($existing['metadata'] ?? '{}', true);
                 $mergedMeta = array_merge($mergedMeta ?: [], ['oauth_provider'=>'google','oauth_profile'=>$profile]);
-                supabase_rest('PATCH', '/rest/v1/users', ['name'=>$userRow['name'],'full_name'=>$userRow['full_name'],'photo_url'=>$picture,'metadata'=>json_encode($mergedMeta),'updated_at'=>$now], "id=eq." . rawurlencode($userId), true);
+                $supabase->rest('PATCH', '/rest/v1/users', ['name'=>$userRow['name'],'full_name'=>$userRow['full_name'],'photo_url'=>$picture,'metadata'=>json_encode($mergedMeta),'updated_at'=>$now], "id=eq." . rawurlencode($userId), true);
             } else {
-                // create
-                [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
+                [$ic,$ir,$ie] = $supabase->rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
                 if ($ic >= 200 && $ic < 300) {
                     $ins = json_decode($ir, true)[0] ?? null;
                     $userId = $ins['id'] ?? null;
                 }
             }
         } else {
-            [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
+            [$ic,$ir,$ie] = $supabase->rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
             $ins = ($ic >=200 && $ic<300) ? (json_decode($ir,true)[0] ?? null) : null;
             $userId = $ins['id'] ?? null;
         }
         if (!$userId) { error_log('user upsert failed for ' . $email); http_response_code(500); echo 'User upsert failed'; exit; }
 
-        // create session token in sessions table
-        $tokenVal = bin2hex(random_bytes(32));
+        // create session token in sessions table - use UUID token
+        $tokenVal = Uuid::uuid4()->toString();
         $sess = ['user_id'=>$userId,'token'=>$tokenVal,'created_at'=>$now,'expires_at'=>date('c', time()+60*60*24*30)];
-        supabase_rest('POST', '/rest/v1/sessions', $sess, '', true);
+        $supabase->rest('POST', '/rest/v1/sessions', $sess, '', true);
 
         // set cookie and redirect
         $cookie = "umuy_token={$tokenVal}; Path=/; Max-Age=" . (60*60*24*30) . "; SameSite=Lax; Secure";
@@ -1215,30 +966,30 @@ switch ($action) {
         // upsert user by email
         $now = date('c');
         $userRow = ['email'=>$email,'name'=>$name,'full_name'=>$name,'photo_url'=>$picture,'updated_at'=>$now,'metadata'=>json_encode(['oauth_provider'=>'facebook','oauth_profile'=>$profile])];
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/users', null, "select=id,metadata&email=eq." . rawurlencode($email) . "&limit=1", true);
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/users', null, "select=id,metadata&email=eq." . rawurlencode($email) . "&limit=1", true);
         if ($c === 200 && !empty($r)) {
             $existing = json_decode($r, true)[0] ?? null;
             if ($existing && $existing['id']) {
                 $userId = $existing['id'];
                 $mergedMeta = json_decode($existing['metadata'] ?? '{}', true);
                 $mergedMeta = array_merge($mergedMeta ?: [], ['oauth_provider'=>'facebook','oauth_profile'=>$profile]);
-                supabase_rest('PATCH', '/rest/v1/users', ['name'=>$userRow['name'],'full_name'=>$userRow['full_name'],'photo_url'=>$picture,'metadata'=>json_encode($mergedMeta),'updated_at'=>$now], "id=eq." . rawurlencode($userId), true);
+                $supabase->rest('PATCH', '/rest/v1/users', ['name'=>$userRow['name'],'full_name'=>$userRow['full_name'],'photo_url'=>$picture,'metadata'=>json_encode($mergedMeta),'updated_at'=>$now], "id=eq." . rawurlencode($userId), true);
             } else {
-                [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
+                [$ic,$ir,$ie] = $supabase->rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
                 $ins = $ic>=200 && $ic<300 ? (json_decode($ir,true)[0] ?? null) : null;
                 $userId = $ins['id'] ?? null;
             }
         } else {
-            [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
+            [$ic,$ir,$ie] = $supabase->rest('POST', '/rest/v1/users', $userRow, '', true, ['Prefer'=>'return=representation']);
             $ins = $ic>=200 && $ic<300 ? (json_decode($ir,true)[0] ?? null) : null;
             $userId = $ins['id'] ?? null;
         }
         if (!$userId) { error_log('user upsert failed for ' . $email); http_response_code(500); echo 'User upsert failed'; exit; }
 
-        // create session token in sessions table
-        $tokenVal = bin2hex(random_bytes(32));
+        // create session token in sessions table - UUID token
+        $tokenVal = Uuid::uuid4()->toString();
         $sess = ['user_id'=>$userId,'token'=>$tokenVal,'created_at'=>$now,'expires_at'=>date('c', time()+60*60*24*30)];
-        supabase_rest('POST', '/rest/v1/sessions', $sess, '', true);
+        $supabase->rest('POST', '/rest/v1/sessions', $sess, '', true);
 
         $cookie = "umuy_token={$tokenVal}; Path=/; Max-Age=" . (60*60*24*30) . "; SameSite=Lax; Secure";
         header('Set-Cookie: ' . $cookie, false);
@@ -1258,7 +1009,7 @@ switch ($action) {
 
         // determine user id
         $userId = null;
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
         if ($c === 200) { $s = json_decode($r, true)[0] ?? null; if ($s && $s['user_id']) $userId = $s['user_id']; }
         if (!$userId) json_out(['error'=>'Unauthorized - user not found'],401);
 
@@ -1277,7 +1028,7 @@ switch ($action) {
             'expires_at' => $expires_at,
             'created_at' => date('c')
         ];
-        [$ic,$ir,$ie] = supabase_rest('POST', '/rest/v1/api_keys', $insert, '', true, ['Prefer'=>'return=representation']);
+        [$ic,$ir,$ie] = $supabase->rest('POST', '/rest/v1/api_keys', $insert, '', true, ['Prefer'=>'return=representation']);
         if ($ic < 200 || $ic >= 300) json_out(['error'=>'Failed to create API key','detail'=>$ir],500);
         $api = json_decode($ir, true)[0] ?? null;
         json_out(['success'=>true,'key'=>$plain,'api'=>$api]);
@@ -1291,11 +1042,11 @@ switch ($action) {
         $token = get_bearer_token();
         if (!$token) json_out(['error'=>'Unauthorized'],401);
         $userId = null;
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
         if ($c === 200) { $s = json_decode($r, true)[0] ?? null; if ($s && $s['user_id']) $userId = $s['user_id']; }
         if (!$userId) json_out(['error'=>'Unauthorized - user not found'],401);
 
-        [$lc,$lr,$le] = supabase_rest('GET', '/rest/v1/api_keys', null, "select=id,name,prefix,revoked,last_used,created_at,expires_at&user_id=eq." . rawurlencode($userId) . "&order=created_at.desc", true);
+        [$lc,$lr,$le] = $supabase->rest('GET', '/rest/v1/api_keys', null, "select=id,name,prefix,revoked,last_used,created_at,expires_at&user_id=eq." . rawurlencode($userId) . "&order=created_at.desc", true);
         if ($lc !== 200) json_out(['error'=>'Failed to list api keys'],500);
         $data = json_decode($lr, true);
         json_out(['success'=>true,'keys'=>$data]);
@@ -1312,11 +1063,11 @@ switch ($action) {
         $token = get_bearer_token();
         if (!$token) json_out(['error'=>'Unauthorized'],401);
         $userId = null;
-        [$c,$r,$e] = supabase_rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
+        [$c,$r,$e] = $supabase->rest('GET', '/rest/v1/sessions', null, "select=user_id&token=eq." . rawurlencode($token) . "&limit=1", true);
         if ($c === 200) { $s = json_decode($r, true)[0] ?? null; if ($s && $s['user_id']) $userId = $s['user_id']; }
         if (!$userId) json_out(['error'=>'Unauthorized - user not found'],401);
 
-        [$uc,$ur,$ue] = supabase_rest('PATCH', '/rest/v1/api_keys', ['revoked' => true], "id=eq." . rawurlencode($id) . "&user_id=eq." . rawurlencode($userId), true, ['Prefer'=>'return=representation']);
+        [$uc,$ur,$ue] = $supabase->rest('PATCH', '/rest/v1/api_keys', ['revoked' => true], "id=eq." . rawurlencode($id) . "&user_id=eq." . rawurlencode($userId), true, ['Prefer'=>'return=representation']);
         if ($uc < 200 || $uc >= 300) json_out(['error'=>'Failed to revoke key','detail'=>$ur],500);
         json_out(['success'=>true]);
         break;
