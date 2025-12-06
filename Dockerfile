@@ -24,11 +24,6 @@ RUN composer install --no-dev --optimize-autoloader --no-interaction --prefer-di
 # Copy the rest of the app
 COPY . .
 
-# Apache: set document root to /public if your app uses it (common in modern PHP)
-# Remove or comment the next 3 lines if your index.php is in the root
-RUN sed -i 's|/var/www/html|/var/www/html/public|g' /etc/apache2/sites-available/000-default.conf
-RUN echo "DirectoryIndex index.php" >> /etc/apache2/apache2.conf
-
 # Enable mod_rewrite (needed for pretty URLs)
 RUN a2enmod rewrite
 
